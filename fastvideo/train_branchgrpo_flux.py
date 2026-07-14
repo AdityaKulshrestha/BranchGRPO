@@ -14,6 +14,7 @@ import torch
 import yaml
 from scipy.io import wavfile
 from torch.utils.data import DataLoader
+from torch.utils.checkpoint import checkpoint
 
 
 @dataclass
@@ -167,6 +168,180 @@ def wav_to_mfcc(wav: np.ndarray, cfg: dict) -> np.ndarray:
         hop_length=int(cfg["hop_length"]),
     )
     return mfcc.astype(np.float32)
+
+
+def load_bigvgan(bigvgan_dir, device, model_name="nvidia/bigvgan_22khz_80band", fmax=8000):
+    """Load the BigVGAN vocoder, isolating its conflicting top-level modules.
+
+    BigVGAN ships top-level modules named ``utils``/``env``/``activations`` that
+    collide with other packages on ``sys.path``; temporarily evict them while
+    importing, mirroring DanceTreeGRPO's loader.
+    """
+    bigvgan_dir = os.path.abspath(os.path.expanduser(bigvgan_dir))
+    if not os.path.isdir(bigvgan_dir):
+        raise FileNotFoundError(
+            f"BigVGAN code directory not found: {bigvgan_dir}. "
+            f"Set eval.bigvgan_dir to the BigVGAN repo folder."
+        )
+
+    conflicting = ["utils", "env", "activations", "meldataset", "bigvgan",
+                   "alias_free_activation"]
+    saved_path = list(sys.path)
+    saved_modules = {name: sys.modules.pop(name, None) for name in conflicting}
+
+    try:
+        sys.path.insert(0, bigvgan_dir)
+        import bigvgan as _bigvgan_module
+
+        model = _bigvgan_module.BigVGAN.from_pretrained(model_name, use_cuda_kernel=False)
+        model.h.fmax = fmax
+        model.remove_weight_norm()
+        model = model.eval().to(device)
+    finally:
+        sys.path[:] = saved_path
+        for name, mod in saved_modules.items():
+            if mod is not None:
+                sys.modules[name] = mod
+            else:
+                sys.modules.pop(name, None)
+
+    return model
+
+
+@torch.no_grad()
+def vocode_mel(mel: np.ndarray, vocoder, device) -> np.ndarray:
+    """Vocode a mel (80, T) into a waveform using BigVGAN."""
+    mel_t = torch.as_tensor(np.asarray(mel, dtype=np.float32))[None].to(device)  # (1, 80, T)
+    wav = vocoder(mel_t).squeeze().detach().cpu().numpy()
+    return wav.astype(np.float32)
+
+
+@torch.no_grad()
+def sample_with_config_steps(diffusion, motion_f, text_f, shape, branch_cfg):
+    """Single-path reverse sampling using the same step count as the rollout config.
+
+    Mirrors ``run_tree_rollout``'s stepping (``t = T - 1 - step_i`` over
+    ``rollout_steps`` steps) so eval generation matches training-time sampling
+    instead of running the full ``diffusion_timesteps`` schedule.
+    """
+    device = motion_f.device
+    total_steps = min(int(branch_cfg["rollout_steps"]), int(branch_cfg["diffusion_timesteps"]))
+    x = torch.randn(shape, device=device)
+    B = shape[0]
+    for step_i in range(total_steps):
+        t = int(diffusion.T - 1 - step_i)
+        if t < 0:
+            break
+        t_batch = torch.full((B,), t, device=device, dtype=torch.long)
+        x = diffusion.p_sample(x, t_batch, motion_f, text_f)
+    return x
+
+
+@torch.no_grad()
+def run_periodic_eval(step, cfg, diffusion, unet, cond_proj, eval_ds, vocoder, device, reward_cfg):
+    """Generate a few validation samples and vocode gen + ground-truth mels to wav.
+
+    Writes ``eval_dir/step_XXXXXXXX/sample_YYYYYYYY/{gt,gen}.wav`` so each eval
+    checkpoint keeps its own audio outputs for comparison.
+    """
+    num_samples = min(int(cfg["eval"]["max_test_samples"]), len(eval_ds))
+    if num_samples <= 0:
+        return
+
+    step_dir = os.path.join(cfg["eval"]["eval_dir"], f"step_{step:08d}")
+    ensure_dir(step_dir)
+    sr = int(reward_cfg["sample_rate"])
+
+    gt_paths, gen_paths = [], []
+    was_training = unet.training
+    unet.eval()
+    cond_proj.eval()
+    try:
+        for i in range(num_samples):
+            sample = eval_ds[i]
+            mel = sample["mel"].numpy().T  # (80, T)
+            motion = sample["motion"].unsqueeze(0).to(device)
+            lyrics = sample["lyrics"].unsqueeze(0).to(device)
+
+            motion_f, text_f = cond_proj(motion, lyrics)
+            out = sample_with_config_steps(
+                diffusion, motion_f, text_f, (1, 80, mel.shape[1]), cfg["branchgrpo"]
+            )
+            gen_mel = out.squeeze(0).detach().cpu().numpy()  # (80, T)
+
+            gt_wav = vocode_mel(mel, vocoder, device)
+            gen_wav = vocode_mel(gen_mel, vocoder, device)
+
+            sample_dir = os.path.join(step_dir, f"sample_{i:08d}")
+            ensure_dir(sample_dir)
+            gt_path = os.path.join(sample_dir, "gt.wav")
+            gen_path = os.path.join(sample_dir, "gen.wav")
+            save_audio(gt_path, gt_wav, sr)
+            save_audio(gen_path, gen_wav, sr)
+            gt_paths.append(gt_path)
+            gen_paths.append(gen_path)
+    finally:
+        if was_training:
+            unet.train()
+            cond_proj.train()
+
+    metrics = compute_eval_metrics(gt_paths, gen_paths)
+    metrics["step"] = int(step)
+    metrics["num_samples"] = num_samples
+    metrics_path = os.path.join(step_dir, "metrics.json")
+    with open(metrics_path, "w", encoding="utf-8") as f:
+        json.dump(metrics, f, indent=2)
+
+    printable = {k: metrics.get(k) for k in ("fad", "acoustic_similarity", "beat_f1", "js", "kl")}
+    print(
+        f"[eval] step={step}: wrote {num_samples} gt/gen wav pairs to {step_dir} | "
+        f"metrics={printable} -> {metrics_path}"
+    )
+
+
+def compute_eval_metrics(gt_paths, gen_paths):
+    """Score gt/gen wav pairs with the shared_codebase metrics (FAD, MFCC cosine,
+    beat F1, JS/KL). Each metric is guarded so a single failure never aborts eval.
+    """
+    metrics = {}
+    if not gt_paths or not gen_paths:
+        return metrics
+
+    try:
+        from metrics.fad import compute_fad
+        fad_val, _ = compute_fad(gt_paths, gen_paths)
+        metrics["fad"] = float(fad_val)
+    except Exception as e:
+        metrics["fad"] = None
+        metrics["fad_error"] = str(e)
+
+    try:
+        from metrics.acoustic_similarity import compute_pairwise_cosine
+        ac = compute_pairwise_cosine(gt_paths, gen_paths)
+        metrics["acoustic_similarity"] = float(np.mean(ac["per_sample"]))
+    except Exception as e:
+        metrics["acoustic_similarity"] = None
+        metrics["acoustic_similarity_error"] = str(e)
+
+    try:
+        from metrics.beat import compute_beat_metrics
+        beat = compute_beat_metrics(gt_paths, gen_paths)
+        metrics["beat_f1"] = float(np.mean(beat["per_sample_f1"]))
+    except Exception as e:
+        metrics["beat_f1"] = None
+        metrics["beat_error"] = str(e)
+
+    try:
+        from metrics.js_kl import compute_js_kl
+        js_kl = compute_js_kl(gt_paths, gen_paths)
+        metrics["js"] = float(js_kl["js_mean"])
+        metrics["kl"] = float(js_kl["kl_mean"])
+    except Exception as e:
+        metrics["js"] = None
+        metrics["kl"] = None
+        metrics["js_kl_error"] = str(e)
+
+    return metrics
 
 
 def gaussian_logprob(sample: torch.Tensor, mean: torch.Tensor, var: torch.Tensor) -> torch.Tensor:
@@ -392,7 +567,7 @@ def gather_leaf_advantages(leaf_nodes: List[TreeNode], depth_pruning: Set[int]) 
     return torch.stack(out, dim=0)
 
 
-def recompute_leaf_path_logprobs(diffusion, unet, motion_f, text_f, leaf_nodes: List[TreeNode], depth_pruning: Set[int]):
+def recompute_leaf_path_logprobs(diffusion, unet, motion_f, text_f, leaf_nodes: List[TreeNode], depth_pruning: Set[int], use_checkpoint: bool = False):
     device = motion_f.device
     out = []
     for leaf in leaf_nodes:
@@ -407,7 +582,17 @@ def recompute_leaf_path_logprobs(diffusion, unet, motion_f, text_f, leaf_nodes: 
             m = motion_f[edge_node.batch_idx : edge_node.batch_idx + 1]
             tx = text_f[edge_node.batch_idx : edge_node.batch_idx + 1]
 
-            mean, beta_t, _ = _transition_stats(diffusion, unet, x_t, t_batch, m, tx)
+            if use_checkpoint:
+                # Recompute this step's UNet activations during backward instead
+                # of storing them, trading compute for a large memory saving.
+                # preserve_rng_state (default) keeps dropout masks consistent.
+                def _transition(x_in, m_in, tx_in, _t=t_batch):
+                    mean_, beta_, _ = _transition_stats(diffusion, unet, x_in, _t, m_in, tx_in)
+                    return mean_, beta_
+
+                mean, beta_t = checkpoint(_transition, x_t, m, tx, use_reentrant=False)
+            else:
+                mean, beta_t, _ = _transition_stats(diffusion, unet, x_t, t_batch, m, tx)
             lp = gaussian_logprob(x_prev, mean, beta_t)
             lp_terms.append(lp[0])
 
@@ -492,6 +677,7 @@ def main() -> None:
     clip_range = float(cfg["train"]["clip_range"])
     ppo_epochs = int(cfg["train"]["ppo_epochs"])
     kl_beta = float(cfg["train"]["kl_beta"])
+    grad_checkpointing = bool(cfg["train"].get("grad_checkpointing", False))
 
     reward_cfg = cfg["reward"]
     w_fad = float(reward_cfg["w_fad"])
@@ -499,6 +685,27 @@ def main() -> None:
 
     depth_pruning = parse_depth_pruning(cfg["branchgrpo"])
     tree_prob_weighted = bool(cfg["branchgrpo"].get("tree_prob_weighted", False))
+
+    # Periodic evaluation on the validation split: generate a few samples and
+    # vocode gen + gt mels to wav.
+    eval_cfg = cfg.get("eval", {}) or {}
+    eval_every_steps = int(eval_cfg.get("eval_every_steps", 0))
+    eval_enabled = eval_every_steps > 0 and int(eval_cfg.get("max_test_samples", 0)) > 0
+    eval_ds = None
+    vocoder = None
+    if eval_enabled:
+        try:
+            eval_ds = MelDataset(cfg["paths"]["val_npz_dir"], align_mode="interp")
+            bigvgan_dir = eval_cfg.get("bigvgan_dir", os.path.join(shared_root, "BigVGAN"))
+            vocoder = load_bigvgan(bigvgan_dir, device)
+            ensure_dir(eval_cfg["eval_dir"])
+            print(
+                f"[eval] periodic eval enabled: every {eval_every_steps} steps, "
+                f"{min(int(eval_cfg['max_test_samples']), len(eval_ds))} val samples, vocoder=BigVGAN"
+            )
+        except Exception as e:  # never let eval setup crash training
+            print(f"[eval] disabled (failed to initialize: {e})")
+            eval_enabled = False
 
     train_log = []
 
@@ -538,13 +745,16 @@ def main() -> None:
 
                 gt_emb = fad_module._get_panns_embedding(gt_path)
                 gen_emb = fad_module._get_panns_embedding(gen_path)
-                fad_score = -float(np.mean((gt_emb - gen_emb) ** 2))
+                # FAD-style score: negative (non-squared) L2 distance between the
+                # gt/gen PANNs embeddings (matches DanceTreeGRPO per-sample FAD).
+                fad_score = -float(np.linalg.norm(gen_emb - gt_emb))
 
-                gt_mfcc = wav_to_mfcc(gt_wav, reward_cfg)
-                gen_mfcc = wav_to_mfcc(gen_wav, reward_cfg)
-                min_t = min(gt_mfcc.shape[1], gen_mfcc.shape[1])
-                mfcc_mse = float(np.mean((gt_mfcc[:, :min_t] - gen_mfcc[:, :min_t]) ** 2))
-                mfcc_score = -mfcc_mse
+                # MFCC score: cosine similarity between the mean MFCC vectors
+                # (matches DanceTreeGRPO MFCC reward). Higher = more similar.
+                gt_mfcc = wav_to_mfcc(gt_wav, reward_cfg).mean(axis=1)
+                gen_mfcc = wav_to_mfcc(gen_wav, reward_cfg).mean(axis=1)
+                denom = float(np.linalg.norm(gt_mfcc) * np.linalg.norm(gen_mfcc)) + 1e-8
+                mfcc_score = float(np.dot(gt_mfcc, gen_mfcc) / denom)
 
                 rewards.append(w_fad * fad_score + w_mfcc * mfcc_score)
 
@@ -562,6 +772,7 @@ def main() -> None:
                     text_f,
                     leaf_nodes,
                     depth_pruning,
+                    use_checkpoint=grad_checkpointing,
                 )
 
                 ratio = torch.exp(new_lp_sum - old_lp_sum)
@@ -584,9 +795,16 @@ def main() -> None:
 
             if step % int(cfg["train"]["log_every_steps"]) == 0:
                 avg_reward = float(np.mean(rewards)) if len(rewards) > 0 else 0.0
+                total_nodes = sum(len(v) for v in nodes_by_depth.values())
+                avg_ratio = float(ratio.mean().item()) if ratio.numel() > 0 else 0.0
+                # GRPO advantages are zero-centred per depth, so their mean is
+                # ~0 by construction. Log the mean-absolute advantage (signal
+                # magnitude) instead, which is what actually drives the update.
+                adv_abs = float(leaf_adv.abs().mean().item()) if leaf_adv.numel() > 0 else 0.0
                 print(
                     f"epoch={epoch} step={step} loss={float(loss.item()):.6f} "
                     f"reward={avg_reward:.6f} leaves={len(leaf_nodes)} "
+                    f"nodes={total_nodes} ratio={avg_ratio:.4f} adv_abs={adv_abs:.4f} "
                     f"split_points={sorted(parse_split_points(cfg['branchgrpo'], int(cfg['branchgrpo']['rollout_steps'])))}"
                 )
                 train_log.append(
@@ -596,6 +814,9 @@ def main() -> None:
                         "loss": float(loss.item()),
                         "avg_reward": avg_reward,
                         "num_leaves": len(leaf_nodes),
+                        "total_nodes": total_nodes,
+                        "avg_ratio": avg_ratio,
+                        "mean_abs_advantage": adv_abs,
                         "w_fad": w_fad,
                         "w_mfcc": w_mfcc,
                     }
@@ -615,6 +836,22 @@ def main() -> None:
                     ckpt_path,
                 )
                 print(f"saved checkpoint: {ckpt_path}")
+
+            if eval_enabled and step > 0 and step % eval_every_steps == 0:
+                try:
+                    run_periodic_eval(
+                        step,
+                        cfg,
+                        diffusion,
+                        unet,
+                        cond_proj,
+                        eval_ds,
+                        vocoder,
+                        device,
+                        reward_cfg,
+                    )
+                except Exception as e:  # never let eval crash training
+                    print(f"[eval] step={step} failed: {e}")
 
             step += 1
 

@@ -1,19 +1,19 @@
 experiment:
   name: lyrics_dance2music_branchgrpo
   seed: 42
-  output_dir: /home/anamf/aditya/dance2music/BranchGRPO/outputs/lyrics_dance2music_branchgrpo
+  output_dir: /home/anam/dance2music/BranchGRPO/outputs/lyrics_dance2music_branchgrpo
 
 paths:
   # Original dataset/model/metric source path from shared_codebase.
-  shared_codebase_root: /home/anamf/aditya/dance2music/shared_codebase
-  train_npz_dir: /home/anamf/aditya/dance2music/shared_codebase/npz_split/train
-  val_npz_dir: /home/anamf/aditya/dance2music/shared_codebase/npz_split/val
-  test_npz_dir: /home/anamf/aditya/dance2music/shared_codebase/npz_split/test
+  shared_codebase_root: /home/anam/dance2music/shared_codebase
+  train_npz_dir: /home/anam/dance2music/shared_codebase/npz_split/train
+  val_npz_dir: /home/anam/dance2music/shared_codebase/npz_split/val
+  test_npz_dir: /home/anam/dance2music/shared_codebase/npz_split/test
 
 train:
-  device: cuda:0
-  num_workers: 4
-  batch_size: 4
+  device: cuda
+  num_workers: 2
+  batch_size: 1
   epochs: 20
   max_steps: 20000
   lr: 1.0e-4
@@ -24,13 +24,14 @@ train:
   ppo_epochs: 1
   clip_range: 0.2
   kl_beta: 0.0
+  grad_checkpointing: true   # recompute UNet activations in backward to cut memory at high rollout_steps
 
 branchgrpo:
   # Tree mechanics
   num_generations: 2
   diffusion_timesteps: 1000
-  rollout_steps: 1000
-  tree_split_points: [0, 250, 500, 750]
+  rollout_steps: 100
+  tree_split_points: [990]
   tree_split_noise_scale: 1.0
   tree_prob_weighted: false
 
@@ -57,10 +58,12 @@ reward:
   griffin_lim_iters: 32
   mfcc_n: 40
   # reward = w_fad * score_fad + w_mfcc * score_mfcc
-  w_fad: 0.7
-  w_mfcc: 0.3
+  w_fad: 1.0
+  w_mfcc: 0.0
 
 eval:
-  max_test_samples: 100
-  eval_dir: /home/anamf/aditya/dance2music/BranchGRPO/outputs/lyrics_dance2music_branchgrpo/evaluation
-  results_dir: /home/anamf/aditya/dance2music/BranchGRPO/outputs/lyrics_dance2music_branchgrpo/results
+  eval_every_steps: 100
+  bigvgan_dir: /home/anam/dance2music/shared_codebase/BigVGAN
+  max_test_samples: 5
+  eval_dir: /home/anam/dance2music/BranchGRPO/outputs/lyrics_dance2music_branchgrpo/evaluation
+  results_dir: /home/anam/dance2music/BranchGRPO/outputs/lyrics_dance2music_branchgrpo/results
