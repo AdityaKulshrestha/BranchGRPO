@@ -18,9 +18,44 @@ def load_config(path: str) -> dict:
         return yaml.safe_load(f)
 
 
-def add_shared_codebase_to_path(shared_root: str) -> None:
-    if shared_root not in sys.path:
-        sys.path.insert(0, shared_root)
+def resolve_shared_codebase_root(shared_root: str) -> str:
+    candidates = []
+    if shared_root:
+        candidates.append(os.path.expanduser(shared_root))
+
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    candidates.append(os.path.abspath(os.path.join(repo_root, "..", "shared_codebase")))
+    candidates.append(os.path.abspath(os.path.join(repo_root, "shared_codebase")))
+
+    for candidate in candidates:
+        if os.path.isdir(candidate) and os.path.isfile(os.path.join(candidate, "datasetcode", "dataset.py")):
+            return candidate
+
+    raise FileNotFoundError(
+        "Unable to locate shared_codebase. Checked: " + ", ".join(candidates)
+    )
+
+
+def resolve_data_path(path_value: str, shared_root: str) -> str:
+    expanded = os.path.expanduser(path_value)
+    if os.path.exists(expanded):
+        return expanded
+
+    marker = "shared_codebase/"
+    if marker in path_value:
+        suffix = path_value.split(marker, 1)[1]
+        candidate = os.path.join(shared_root, suffix)
+        if os.path.exists(candidate):
+            return candidate
+
+    return expanded
+
+
+def add_shared_codebase_to_path(shared_root: str) -> str:
+    resolved_root = resolve_shared_codebase_root(shared_root)
+    if resolved_root not in sys.path:
+        sys.path.insert(0, resolved_root)
+    return resolved_root
 
 
 def ensure_dir(path: str) -> None:
@@ -66,7 +101,11 @@ def main():
     args = parser.parse_args()
 
     cfg = load_config(args.config)
-    add_shared_codebase_to_path(cfg["paths"]["shared_codebase_root"])
+    shared_root = add_shared_codebase_to_path(cfg["paths"].get("shared_codebase_root", ""))
+    cfg["paths"]["shared_codebase_root"] = shared_root
+    cfg["paths"]["train_npz_dir"] = resolve_data_path(cfg["paths"]["train_npz_dir"], shared_root)
+    cfg["paths"]["val_npz_dir"] = resolve_data_path(cfg["paths"]["val_npz_dir"], shared_root)
+    cfg["paths"]["test_npz_dir"] = resolve_data_path(cfg["paths"]["test_npz_dir"], shared_root)
 
     from datasetcode.dataset import MelDataset
     from models.diffusion import GaussianDiffusion
