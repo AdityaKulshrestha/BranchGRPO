@@ -1,0 +1,66 @@
+experiment:
+  name: lyrics_dance2music_branchgrpo
+  seed: 42
+  output_dir: /home/anamf/aditya/dance2music/BranchGRPO/outputs/lyrics_dance2music_branchgrpo
+
+paths:
+  # Original dataset/model/metric source path from shared_codebase.
+  shared_codebase_root: /home/anamf/aditya/dance2music/shared_codebase
+  train_npz_dir: /home/anamf/aditya/dance2music/shared_codebase/npz_split/train
+  val_npz_dir: /home/anamf/aditya/dance2music/shared_codebase/npz_split/val
+  test_npz_dir: /home/anamf/aditya/dance2music/shared_codebase/npz_split/test
+
+train:
+  device: cuda:0
+  num_workers: 4
+  batch_size: 4
+  epochs: 20
+  max_steps: 20000
+  lr: 1.0e-4
+  weight_decay: 1.0e-4
+  grad_clip: 1.0
+  save_every_steps: 500
+  log_every_steps: 10
+  ppo_epochs: 1
+  clip_range: 0.2
+  kl_beta: 0.0
+
+branchgrpo:
+  # Tree mechanics
+  num_generations: 2
+  diffusion_timesteps: 1000
+  rollout_steps: 1000
+  tree_split_points: [0, 250, 500, 750]
+  tree_split_noise_scale: 1.0
+  tree_prob_weighted: false
+
+  # Pruning controls
+  width_pruning_mode: 0      # 0=off, 1=per-parent, 2=global top-k
+  width_pruning_ratio: 1.0   # keep ratio for width pruning
+  depth_pruning: []          # depth ids to exclude from PPO logprob/advantage
+
+model:
+  cond_dim: 128
+  base_dim: 256
+  dim_mults: [1, 2, 4]
+  time_emb_dim: 256
+  num_res_blocks: 2
+  mid_blocks: 3
+  attn_heads: 8
+
+reward:
+  sample_rate: 22050
+  n_fft: 1024
+  hop_length: 256
+  win_length: 1024
+  n_mels: 80
+  griffin_lim_iters: 32
+  mfcc_n: 40
+  # reward = w_fad * score_fad + w_mfcc * score_mfcc
+  w_fad: 0.7
+  w_mfcc: 0.3
+
+eval:
+  max_test_samples: 100
+  eval_dir: /home/anamf/aditya/dance2music/BranchGRPO/outputs/lyrics_dance2music_branchgrpo/evaluation
+  results_dir: /home/anamf/aditya/dance2music/BranchGRPO/outputs/lyrics_dance2music_branchgrpo/results

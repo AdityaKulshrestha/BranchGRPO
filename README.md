@@ -1,131 +1,154 @@
-# BranchGRPO: Stable and Efficient GRPO with Structured Branching in Diffusion Models (WIP)
+# BranchGRPO for Lyrics + Dance to Music
 
-**BranchGRPO** is a novel approach that restructures the rollout process into a branching tree, where shared prefixes amortize computation and pruning removes low-value paths and redundant depths.
+This repository is configured for a single experiment family: lyrics+dance-to-music training with BranchGRPO tree rollout mechanics, running on one GPU and reusing UNet/audio components from shared_codebase.
 
-📄 **Paper**: [arXiv:2509.06040](https://arxiv.org/abs/2509.06040)  
-🌐 **Project Page**: [https://fredreic1849.github.io/BranchGRPO-Webpage/](https://fredreic1849.github.io/BranchGRPO-Webpage/)  
-💻 **Code**: [GitHub Repository](https://github.com/your-username/BranchGRPO)
+## What is active in this codebase
 
-## Abstract
+- Model stack: CondProjection + UNet1D_ultimate + GaussianDiffusion from shared_codebase modules.
+- Training entry: fastvideo/train_branchgrpo_flux.py.
+- Evaluation entry: fastvideo/eval_lyrics2music.py.
+- One unified configuration file: config_lyrics2music_branchgrpo.yaml.
+- Shared dataset roots are used directly (no separate preprocessing tree in BranchGRPO).
 
-Recent progress in aligning image and video generative models with Group Relative Policy Optimization (GRPO) has improved human preference alignment, yet existing approaches still suffer from high computational cost due to sequential rollouts and large numbers of SDE sampling steps, as well as training instability caused by sparse rewards. In this paper, we present BranchGRPO, a method that restructures the rollout process into a branching tree, where shared prefixes amortize computation and pruning removes low-value paths and redundant depths.
+## Setup
 
-## Key Features
-
-BranchGRPO introduces three main contributions:
-
-1. **Branch Sampling Scheme**: Reduces rollout cost by reusing common segments
-2. **Tree-based Advantage Estimator**: Converts sparse terminal rewards into dense, step-level signals  
-3. **Pruning Strategies**: Accelerate convergence while preserving exploration
-
-## Performance
-
-- **16% improvement** in alignment scores over strong baselines on HPDv2.1 image alignment
-- **55% reduction** in per-iteration training time
-- Higher Video-Align scores with sharper and temporally consistent frames on WanX-1.3B video generation
-
-## Getting Started
-
-### Prerequisites
-
-- Python 3.8+
-- PyTorch 2.0+
-- CUDA 11.8+
-- 8+ GPUs (H800/A100 recommended)
-
-### Installation
+1. Create or activate your environment.
+2. Install dependencies:
 
 ```bash
-# Clone the repository
-git clone https://github.com/your-username/BranchGRPO.git
-cd BranchGRPO
-
-# Set up environment
-./env_setup.sh branchgrpo
-
-# Install dependencies
+cd /home/anamf/aditya/dance2music/BranchGRPO
 pip install -r requirements.txt
 ```
 
-### Download Checkpoints
+3. Ensure the shared dataset paths exist and are readable:
 
-1. **FLUX checkpoints**: Download from [here](https://huggingface.co/black-forest-labs/FLUX.1-dev) to `./data/flux`
-2. **HPS-v2.1 checkpoint**: Download from [here](https://huggingface.co/xswu/HPSv2/tree/main) to `./hps_ckpt`
-3. **CLIP H-14 checkpoint**: Download from [here](https://huggingface.co/laion/CLIP-ViT-H-14-laion2B-s32B-b79K/tree/main) to `./hps_ckpt`
+- /home/anamf/aditya/dance2music/shared_codebase/npz_split/train
+- /home/anamf/aditya/dance2music/shared_codebase/npz_split/val
+- /home/anamf/aditya/dance2music/shared_codebase/npz_split/test
 
-### Quick Start
+4. Ensure the local FAD checkpoint expected by shared metrics exists:
 
+- fastvideo/../shared_codebase/metrics/audioset_tagging_cnn/checkpoints/Cnn14_mAP=0.431.pth
 
-#### Multi-GPU Training
+## Training
+
+Run training directly:
+
 ```bash
-# Preprocess embeddings (8 GPUs)
-bash scripts/preprocess/preprocess_flux_rl_embeddings.sh
-
-# Train with BranchGRPO (8 GPUs)
-bash scripts/finetune/finetune_flux_branchgrpo_8gpus.sh
+cd /home/anamf/aditya/dance2music/BranchGRPO
+python fastvideo/train_branchgrpo_flux.py --config config_lyrics2music_branchgrpo.yaml
 ```
 
-Note: For multi-node training, please configure the launcher (e.g., Slurm, torchrun, MPI) according to your own cluster environment.
+Or via launcher:
 
-### Configuration
-
-Key parameters for BranchGRPO:
-
-- `--tree_split_points`: Comma-separated split points (e.g., "0,3,6,9")
-- `--tree_split_noise_scale`: Noise scale for tree splits (default: 4.0)
-- `--depth_pruning`: Depths to prune from training (e.g., "15,16,17")
-- `--width_pruning_mode`: Width pruning strategy (0=none, 1=best per branch, 2=global best/worst)
-- `--mix_ode_sde_tree`: Enable mixed ODE/SDE rollout
-
-## Method Overview
-
-BranchGRPO restructures sequential GRPO rollouts into a branching tree:
-
-1. **Branching Rollouts**: At selected denoising steps, trajectories split into multiple children that share early prefixes
-2. **Reward Fusion**: Leaf rewards are fused upward using path-probability weighting
-3. **Depth-wise Normalization**: Normalized per depth to obtain dense, step-wise advantages
-4. **Pruning**: Lightweight width and depth pruning limit backpropagation to selected nodes
-
-## Results
-
-### Efficiency-Quality Comparison
-
-| Method              | NFE π_θ_old | NFE π_θ | Iteration Time (s)↓ | HPS-v2.1↑ | Pick Score↑ | Image Reward↑ |
-| ------------------- | ----------- | ------- | ------------------- | --------- | ----------- | ------------- |
-| FLUX                | -           | -       | -                   | 0.313     | 0.227       | 1.112         |
-| DanceGRPO (tf=1.0)  | 20          | 20      | 698                 | 0.360     | 0.229       | 1.189         |
-| DanceGRPO (tf=0.6)  | 20          | 12      | 469                 | 0.353     | 0.228       | 1.219         |
-| MixGRPO (20,5)      | 20          | 5       | 289                 | 0.359     | 0.228       | 1.211         |
-| BranchGRPO          | 13.68       | 13.68   | 493                 | 0.363     | 0.229       | 1.233         |
-| BranchGRPO-WidPru   | 13.68       | 8.625   | 314                 | 0.364     | 0.230       | 1.300         |
-| BranchGRPO-DepPru   | 13.68       | 8.625   | 314                 | **0.369** | **0.231**   | **1.319**     |
-| BranchGRPO-Mix      | 13.68       | 4.25    | 148                 | 0.363     | 0.230       | 1.290         |
-
-
-## Contributing
-
-We welcome contributions! Please see our [contributing guidelines](CONTRIBUTING.md) for details.
-
-## Acknowledgments
-
-This work builds upon:
-- [FastVideo](https://github.com/hao-ai-lab/FastVideo)
-- [DanceGRPO](https://github.com/XueZeyue/DanceGRPO)
-- [diffusers](https://github.com/huggingface/diffusers)
-
-## Citation
-
-If you use BranchGRPO in your research, please cite our paper:
-
-```bibtex
-@article{li2025branchgrpo,
-  title={BranchGRPO: Stable and Efficient GRPO with Structured Branching in Diffusion Models},
-  author={Li, Yuming and Wang, Yikai and Zhu, Yuying and Zhao, Zhongyu and Lu, Ming and She, Qi and Zhang, Shanghang},
-  journal={arXiv preprint arXiv:2509.06040},
-  year={2025}
-}
+```bash
+bash scripts/finetune/finetune_flux_branchgrpo_8gpus.sh config_lyrics2music_branchgrpo.yaml
 ```
 
-## License
+Checkpoints are saved under:
 
-This project is licensed under the Apache License 2.0 - see the [LICENSE](LICENSE) file for details.
+- outputs/lyrics_dance2music_branchgrpo/checkpoints
+
+## Inference + Evaluation
+
+Run single-process generation and metrics:
+
+```bash
+cd /home/anamf/aditya/dance2music/BranchGRPO
+python fastvideo/eval_lyrics2music.py \
+  --config config_lyrics2music_branchgrpo.yaml \
+  --checkpoint /home/anamf/aditya/dance2music/BranchGRPO/outputs/lyrics_dance2music_branchgrpo/checkpoints/ckpt_final.pt
+```
+
+Or via launcher:
+
+```bash
+bash scripts/finetune/finetune_flux_grpo.sh \
+  config_lyrics2music_branchgrpo.yaml \
+  /home/anamf/aditya/dance2music/BranchGRPO/outputs/lyrics_dance2music_branchgrpo/checkpoints/ckpt_final.pt
+```
+
+Outputs:
+
+- Sample audio pairs: outputs/lyrics_dance2music_branchgrpo/evaluation/sample_xxxxxxxx/{gt.wav,gen.wav}
+- JSON metrics: outputs/lyrics_dance2music_branchgrpo/results/evaluation_results.json
+
+## Tree-BranchGRPO mechanics
+
+The trainer includes full tree rollout and optimization flow:
+
+1. Split-point branching:
+- At diffusion steps listed in branchgrpo.tree_split_points, each live node expands to branchgrpo.num_generations children.
+
+2. Width pruning:
+- width_pruning_mode=0: disabled.
+- width_pruning_mode=1: keep top children per parent by edge log-prob.
+- width_pruning_mode=2: keep global top children by edge log-prob.
+- width_pruning_ratio controls retained fraction.
+
+3. Reward assignment and upstream propagation:
+- Leaf rewards are computed from generated audio.
+- Internal node rewards are upstreamed from children by:
+  - mean(child rewards), or
+  - softmax(edge log-prob)-weighted sum if tree_prob_weighted=true.
+
+4. Depth-wise advantages:
+- Nodes at the same depth are normalized to produce node advantages.
+- Leaf optimization advantage is the mean of path node advantages, optionally excluding depths listed in depth_pruning.
+
+5. PPO update on path likelihoods:
+- Old path log-prob is recorded during rollout.
+- New path log-prob is recomputed with current model.
+- PPO clipped ratio objective is applied per leaf path.
+
+## Sampling mode: DDPM or DDIM
+
+- Active sampling in both training rollout and evaluation is DDPM-style ancestral sampling.
+- In training rollout, each reverse step samples x_{t-1} from mean + sqrt(beta_t)*noise.
+- In evaluation, GaussianDiffusion.sample calls p_sample iteratively over timesteps.
+- A DDIM helper exists in shared_codebase/models/diffusion.py (ddim_sample), but it is not used by the active train/eval scripts.
+
+## Batching support
+
+- Training supports batching.
+- DataLoader uses train.batch_size.
+- Tree rollout builds one root per batch sample and tracks batch_idx through branching.
+- Reward computation maps each leaf back to its source batch item via leaf.batch_idx.
+
+- Evaluation script currently runs one sample at a time (it loops over dataset and uses shape (1, 80, T)).
+- The diffusion core supports batched sampling, but eval script is intentionally single-process/single-item for stable metric generation.
+
+## Reward definition
+
+Per leaf:
+
+- FAD proxy score:
+  - Convert mel to waveform.
+  - Extract PANNs embedding for gt/gen wav.
+  - score_fad = -mean((emb_gt - emb_gen)^2).
+
+- MFCC score:
+  - Compute MFCC(gt) and MFCC(gen).
+  - score_mfcc = -MSE(MFCC_gt, MFCC_gen).
+
+Final leaf reward:
+
+- reward = reward.w_fad * score_fad + reward.w_mfcc * score_mfcc
+
+These leaf rewards are then upstreamed through the rollout tree to compute node rewards and advantages.
+
+## Main config knobs
+
+Key fields in config_lyrics2music_branchgrpo.yaml:
+
+- train.batch_size
+- train.ppo_epochs
+- train.clip_range
+- branchgrpo.tree_split_points
+- branchgrpo.num_generations
+- branchgrpo.width_pruning_mode
+- branchgrpo.width_pruning_ratio
+- branchgrpo.depth_pruning
+- branchgrpo.tree_prob_weighted
+- reward.w_fad
+- reward.w_mfcc
