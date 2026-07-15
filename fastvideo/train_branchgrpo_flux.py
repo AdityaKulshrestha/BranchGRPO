@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import copy
 import json
 import os
 import random
@@ -142,23 +143,6 @@ def parse_depth_pruning(branch_cfg: dict) -> Set[int]:
     return {int(x) for x in depths}
 
 
-def mel_to_wav(mel: np.ndarray, cfg: dict) -> np.ndarray:
-    mel_db = mel.astype(np.float32)
-    mel_power = librosa.db_to_power(np.clip(mel_db, -80.0, 20.0))
-    wav = librosa.feature.inverse.mel_to_audio(
-        mel_power,
-        sr=int(cfg["sample_rate"]),
-        n_fft=int(cfg["n_fft"]),
-        hop_length=int(cfg["hop_length"]),
-        win_length=int(cfg["win_length"]),
-        n_iter=int(cfg["griffin_lim_iters"]),
-    )
-    peak = np.max(np.abs(wav))
-    if peak > 1e-8:
-        wav = wav / peak
-    return wav.astype(np.float32)
-
-
 def wav_to_mfcc(wav: np.ndarray, cfg: dict) -> np.ndarray:
     mfcc = librosa.feature.mfcc(
         y=wav,
@@ -268,6 +252,8 @@ def run_periodic_eval(step, cfg, diffusion, unet, cond_proj, eval_ds, vocoder, d
                 diffusion, motion_f, text_f, (1, 80, mel.shape[1]), cfg["branchgrpo"]
             )
             gen_mel = out.squeeze(0).detach().cpu().numpy()  # (80, T)
+            # de-normalize rollout output back to raw BigVGAN log-mel space.
+            gen_mel = gen_mel * float(diffusion.dataset_std) + float(diffusion.dataset_mean)
 
             gt_wav = vocode_mel(mel, vocoder, device)
             gen_wav = vocode_mel(gen_mel, vocoder, device)
@@ -660,11 +646,50 @@ def main() -> None:
         attn_heads=int(cfg["model"]["attn_heads"]),
     ).to(device)
 
+    # Load the pretrained policy checkpoint (GRPO initialization). Prefer EMA
+    # weights and reuse the mel normalization stats saved in the checkpoint,
+    # matching shared_codebase/sample.py and train.py.
+    init_ckpt_path = cfg["train"].get("init_checkpoint", None)
+    dataset_mean, dataset_std = 0.0, 1.0
+    if init_ckpt_path:
+        init_ckpt = torch.load(os.path.expanduser(init_ckpt_path), map_location=device)
+        if "ema_unet" in init_ckpt or "ema_cond_proj" in init_ckpt:
+            print(f"[init] loading EMA weights from {init_ckpt_path}")
+            unet.load_state_dict(init_ckpt.get("ema_unet", init_ckpt["unet"]), strict=False)
+            cond_proj.load_state_dict(init_ckpt.get("ema_cond_proj", init_ckpt["cond_proj"]), strict=False)
+        else:
+            print(f"[init] loading weights from {init_ckpt_path}")
+            unet.load_state_dict(init_ckpt["unet"], strict=True)
+            cond_proj.load_state_dict(init_ckpt["cond_proj"], strict=True)
+        if init_ckpt.get("dataset_mean", None) is not None:
+            dataset_mean = float(init_ckpt["dataset_mean"])
+        if init_ckpt.get("dataset_std", None) is not None:
+            dataset_std = float(init_ckpt["dataset_std"])
+        print(f"[init] dataset mean/std = {dataset_mean} / {dataset_std}")
+    else:
+        print("[init] no init_checkpoint provided; training from scratch (mean=0/std=1)")
+
     diffusion = GaussianDiffusion(
         unet,
         timesteps=int(cfg["branchgrpo"]["diffusion_timesteps"]),
         device=str(device),
+        dataset_mean=dataset_mean,
+        dataset_std=dataset_std,
     )
+
+    # EMA copies for stable evaluation/sampling and consistent checkpoint format,
+    # matching shared_codebase/train.py.
+    ema_decay = float(cfg["train"].get("ema_decay", 0.9998))
+    ema_unet = copy.deepcopy(unet)
+    ema_cond_proj = copy.deepcopy(cond_proj)
+    for p in ema_unet.parameters():
+        p.requires_grad = False
+    for p in ema_cond_proj.parameters():
+        p.requires_grad = False
+
+    # BigVGAN neural vocoder, used for both the reward audio and periodic eval.
+    bigvgan_dir = cfg.get("eval", {}).get("bigvgan_dir", os.path.join(shared_root, "BigVGAN"))
+    vocoder = load_bigvgan(bigvgan_dir, device)
 
     optim = Adan(
         list(unet.parameters()) + list(cond_proj.parameters()),
@@ -687,17 +712,14 @@ def main() -> None:
     tree_prob_weighted = bool(cfg["branchgrpo"].get("tree_prob_weighted", False))
 
     # Periodic evaluation on the validation split: generate a few samples and
-    # vocode gen + gt mels to wav.
+    # vocode gen + gt mels to wav (reuses the vocoder loaded above).
     eval_cfg = cfg.get("eval", {}) or {}
     eval_every_steps = int(eval_cfg.get("eval_every_steps", 0))
     eval_enabled = eval_every_steps > 0 and int(eval_cfg.get("max_test_samples", 0)) > 0
     eval_ds = None
-    vocoder = None
     if eval_enabled:
         try:
             eval_ds = MelDataset(cfg["paths"]["val_npz_dir"], align_mode="interp")
-            bigvgan_dir = eval_cfg.get("bigvgan_dir", os.path.join(shared_root, "BigVGAN"))
-            vocoder = load_bigvgan(bigvgan_dir, device)
             ensure_dir(eval_cfg["eval_dir"])
             print(
                 f"[eval] periodic eval enabled: every {eval_every_steps} steps, "
@@ -733,10 +755,12 @@ def main() -> None:
             for i, leaf in enumerate(leaf_nodes):
                 gt_idx = leaf.batch_idx
                 gt_mel_np = gt_mel[gt_idx].detach().cpu().numpy()
-                gen_mel_np = final_mel[i].detach().cpu().numpy()
+                # rollout output is in normalized space; de-normalize to raw
+                # BigVGAN log-mel space before vocoding (gt mel is already raw).
+                gen_mel_np = final_mel[i].detach().cpu().numpy() * dataset_std + dataset_mean
 
-                gt_wav = mel_to_wav(gt_mel_np, reward_cfg)
-                gen_wav = mel_to_wav(gen_mel_np, reward_cfg)
+                gt_wav = vocode_mel(gt_mel_np, vocoder, device)
+                gen_wav = vocode_mel(gen_mel_np, vocoder, device)
 
                 gt_path = os.path.join(tmp_audio_dir, f"step{step}_leaf{i}_gt.wav")
                 gen_path = os.path.join(tmp_audio_dir, f"step{step}_leaf{i}_gen.wav")
@@ -793,6 +817,13 @@ def main() -> None:
                     )
                 optim.step()
 
+            # update EMA after optimizer step(s), matching shared_codebase.
+            with torch.no_grad():
+                for ema_p, p in zip(ema_unet.parameters(), unet.parameters()):
+                    ema_p.data.mul_(ema_decay).add_(p.data * (1.0 - ema_decay))
+                for ema_p, p in zip(ema_cond_proj.parameters(), cond_proj.parameters()):
+                    ema_p.data.mul_(ema_decay).add_(p.data * (1.0 - ema_decay))
+
             if step % int(cfg["train"]["log_every_steps"]) == 0:
                 avg_reward = float(np.mean(rewards)) if len(rewards) > 0 else 0.0
                 total_nodes = sum(len(v) for v in nodes_by_depth.values())
@@ -831,7 +862,10 @@ def main() -> None:
                         "unet": unet.state_dict(),
                         "cond_proj": cond_proj.state_dict(),
                         "optim": optim.state_dict(),
-                        "config": cfg,
+                        "dataset_mean": getattr(diffusion, "dataset_mean", None),
+                        "dataset_std": getattr(diffusion, "dataset_std", None),
+                        "ema_unet": ema_unet.state_dict(),
+                        "ema_cond_proj": ema_cond_proj.state_dict(),
                     },
                     ckpt_path,
                 )
@@ -866,7 +900,10 @@ def main() -> None:
             "unet": unet.state_dict(),
             "cond_proj": cond_proj.state_dict(),
             "optim": optim.state_dict(),
-            "config": cfg,
+            "dataset_mean": getattr(diffusion, "dataset_mean", None),
+            "dataset_std": getattr(diffusion, "dataset_std", None),
+            "ema_unet": ema_unet.state_dict(),
+            "ema_cond_proj": ema_cond_proj.state_dict(),
         },
         final_ckpt,
     )

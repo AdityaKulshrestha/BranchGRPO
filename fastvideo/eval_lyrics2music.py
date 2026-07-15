@@ -5,7 +5,6 @@ import os
 import sys
 from glob import glob
 
-import librosa
 import numpy as np
 import torch
 import yaml
@@ -67,17 +66,49 @@ def save_audio(path: str, wav: np.ndarray, sr: int) -> None:
     wavfile.write(path, sr, audio_i16)
 
 
-def mel_to_wav(mel: np.ndarray, reward_cfg: dict) -> np.ndarray:
-    mel_db = mel.astype(np.float32)
-    mel_power = librosa.db_to_power(np.clip(mel_db, -80.0, 20.0))
-    wav = librosa.feature.inverse.mel_to_audio(
-        mel_power,
-        sr=int(reward_cfg["sample_rate"]),
-        n_fft=int(reward_cfg["n_fft"]),
-        hop_length=int(reward_cfg["hop_length"]),
-        win_length=int(reward_cfg["win_length"]),
-        n_iter=int(reward_cfg["griffin_lim_iters"]),
-    )
+def load_bigvgan(bigvgan_dir, device, model_name="nvidia/bigvgan_22khz_80band", fmax=8000):
+    """Load the BigVGAN vocoder, isolating its conflicting top-level modules.
+
+    BigVGAN ships top-level modules named ``utils``/``env``/``activations`` that
+    collide with other packages on ``sys.path``; temporarily evict them while
+    importing, mirroring the training script's loader.
+    """
+    bigvgan_dir = os.path.abspath(os.path.expanduser(bigvgan_dir))
+    if not os.path.isdir(bigvgan_dir):
+        raise FileNotFoundError(
+            f"BigVGAN code directory not found: {bigvgan_dir}. "
+            f"Set eval.bigvgan_dir to the BigVGAN repo folder."
+        )
+
+    conflicting = ["utils", "env", "activations", "meldataset", "bigvgan",
+                   "alias_free_activation"]
+    saved_path = list(sys.path)
+    saved_modules = {name: sys.modules.pop(name, None) for name in conflicting}
+
+    try:
+        sys.path.insert(0, bigvgan_dir)
+        import bigvgan as _bigvgan_module
+
+        model = _bigvgan_module.BigVGAN.from_pretrained(model_name, use_cuda_kernel=False)
+        model.h.fmax = fmax
+        model.remove_weight_norm()
+        model = model.eval().to(device)
+    finally:
+        sys.path[:] = saved_path
+        for name, mod in saved_modules.items():
+            if mod is not None:
+                sys.modules[name] = mod
+            else:
+                sys.modules.pop(name, None)
+
+    return model
+
+
+@torch.no_grad()
+def vocode_mel(mel: np.ndarray, vocoder, device) -> np.ndarray:
+    """Vocode a mel (80, T) into a waveform using BigVGAN."""
+    mel_t = torch.as_tensor(np.asarray(mel, dtype=np.float32))[None].to(device)  # (1, 80, T)
+    wav = vocoder(mel_t).squeeze().detach().cpu().numpy()
     peak = np.max(np.abs(wav))
     if peak > 1e-8:
         wav = wav / peak
@@ -139,16 +170,36 @@ def main():
     ).to(device)
 
     ckpt = torch.load(args.checkpoint, map_location=device)
-    unet.load_state_dict(ckpt["unet"], strict=True)
-    cond_proj.load_state_dict(ckpt["cond_proj"], strict=True)
+
+    # Prefer EMA weights when present, mirroring shared_codebase/sample.py.
+    if "ema_unet" in ckpt or "ema_cond_proj" in ckpt:
+        print("found EMA weights in ckpt; loading EMA for sampling")
+        unet.load_state_dict(ckpt.get("ema_unet", ckpt["unet"]), strict=False)
+        cond_proj.load_state_dict(ckpt.get("ema_cond_proj", ckpt["cond_proj"]), strict=False)
+    else:
+        unet.load_state_dict(ckpt["unet"], strict=True)
+        cond_proj.load_state_dict(ckpt["cond_proj"], strict=True)
     unet.eval()
     cond_proj.eval()
+
+    # Mel de-normalization stats: prefer values saved in the ckpt, matching
+    # shared_codebase/sample.py (fallback to its default constants).
+    dataset_mean = float(ckpt.get("dataset_mean", -4.63706636428833))
+    dataset_std = float(ckpt.get("dataset_std", 1.8648223876953125))
+    print(f"using dataset mean/std: {dataset_mean} {dataset_std}")
 
     diffusion = GaussianDiffusion(
         unet,
         timesteps=int(cfg["branchgrpo"]["diffusion_timesteps"]),
         device=str(device),
+        dataset_mean=dataset_mean,
+        dataset_std=dataset_std,
     )
+
+    # BigVGAN neural vocoder (same as training / shared_codebase), instead of
+    # the Griffin-Lim inversion which does not match the BigVGAN log-mel space.
+    bigvgan_dir = cfg["eval"].get("bigvgan_dir", os.path.join(shared_root, "BigVGAN"))
+    vocoder = load_bigvgan(bigvgan_dir, device)
 
     eval_dir = cfg["eval"]["eval_dir"]
     results_dir = cfg["eval"]["results_dir"]
@@ -169,8 +220,13 @@ def main():
             out = diffusion.sample((1, 80, mel.shape[1]), motion_f, text_f)
             gen_mel = out.squeeze(0).detach().cpu().numpy()
 
-        gt_wav = mel_to_wav(mel, cfg["reward"])
-        gen_wav = mel_to_wav(gen_mel, cfg["reward"])
+        # diffusion.sample() returns mel in normalized space; de-normalize back
+        # to BigVGAN log-mel space before vocoding (shared_codebase/sample.py).
+        gen_mel = gen_mel * dataset_std + dataset_mean
+
+        # gt mel from the dataset is already the raw BigVGAN log-mel.
+        gt_wav = vocode_mel(mel, vocoder, device)
+        gen_wav = vocode_mel(gen_mel, vocoder, device)
 
         sample_dir = os.path.join(eval_dir, f"sample_{i:08d}")
         ensure_dir(sample_dir)

@@ -25,12 +25,15 @@ train:
   clip_range: 0.2
   kl_beta: 0.0
   grad_checkpointing: true   # recompute UNet activations in backward to cut memory at high rollout_steps
+  # GRPO policy initialization: pretrained checkpoint (EMA weights + mel stats reused).
+  init_checkpoint: /home/anam/dance2music/shared_codebase/checkpoints_exact/ckpt_final_none.pt
+  ema_decay: 0.9998
 
 branchgrpo:
   # Tree mechanics
   num_generations: 2
   diffusion_timesteps: 1000
-  rollout_steps: 100
+  rollout_steps: 1000
   tree_split_points: [990]
   tree_split_noise_scale: 1.0
   tree_prob_weighted: false
@@ -65,5 +68,6 @@ eval:
   eval_every_steps: 100
   bigvgan_dir: /home/anam/dance2music/shared_codebase/BigVGAN
   max_test_samples: 5
+  # Total test samples: 197
   eval_dir: /home/anam/dance2music/BranchGRPO/outputs/lyrics_dance2music_branchgrpo/evaluation
   results_dir: /home/anam/dance2music/BranchGRPO/outputs/lyrics_dance2music_branchgrpo/results
