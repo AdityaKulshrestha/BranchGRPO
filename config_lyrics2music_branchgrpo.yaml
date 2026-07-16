@@ -24,16 +24,14 @@ train:
   ppo_epochs: 1
   clip_range: 0.2
   kl_beta: 0.0
-  max_train_samples: 16   # 0 = use all training samples; >0 limits to first N
-  grad_checkpointing: false  # disabled: trunk pruning + bf16 keep memory in budget without the recompute slowdown
-  bf16: true                 # run UNet forwards in bfloat16 (weights/optimizer stay fp32)
+  grad_checkpointing: true   # recompute UNet activations in backward to cut memory at high rollout_steps
   # GRPO policy initialization: pretrained checkpoint (EMA weights + mel stats reused).
   init_checkpoint: /home/anam/dance2music/shared_codebase/checkpoints_exact/ckpt_final_none.pt
   ema_decay: 0.9998
 
 branchgrpo:
   # Tree mechanics
-  num_generations: 8
+  num_generations: 2
   diffusion_timesteps: 1000
   rollout_steps: 1000
   tree_split_points: [990]
@@ -43,20 +41,12 @@ branchgrpo:
   advantage_clip: 5.0
   advantage_scale: 1.0
 
-<<<<<<< HEAD
   # Pruning controls (applied after rewards/advantages, for backprop only)
   width_pruning_mode: none   # none, parent_top1, or extreme
   width_pruning_extreme_b: 1 # extreme keeps global best b and worst b leaves
   depth_pruning: []          # individual edge depths to exclude from backprop
   # Split step 990 creates children at depth 991. Skip the shared, zero-signal prefix.
   depth_pruning_ranges: [[1, 990]] # inclusive [start_depth, end_depth] ranges
-=======
-  # Pruning controls
-  width_pruning_mode: 0      # 0=off, 1=per-parent, 2=global top-k
-  width_pruning_ratio: 1.0   # keep ratio for width pruning
-  depth_pruning: []          # depth ids to exclude from PPO logprob/advantage
-  prune_shared_trunk: true   # drop pre-first-split (shared, zero-advantage) steps from the PPO log-prob graph
->>>>>>> 342fdbe (Added pruning of adv for shared prefix)
 
 model:
   cond_dim: 128
@@ -82,7 +72,7 @@ reward:
 eval:
   eval_every_steps: 100
   bigvgan_dir: /home/anam/dance2music/shared_codebase/BigVGAN
-  max_test_samples: 20
+  max_test_samples: 5
   # Total test samples: 197
   eval_dir: /home/anam/dance2music/BranchGRPO/outputs/lyrics_dance2music_branchgrpo/evaluation
   results_dir: /home/anam/dance2music/BranchGRPO/outputs/lyrics_dance2music_branchgrpo/results

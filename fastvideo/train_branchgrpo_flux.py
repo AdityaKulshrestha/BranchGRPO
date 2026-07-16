@@ -16,7 +16,6 @@ import yaml
 from scipy.io import wavfile
 from torch.utils.data import DataLoader
 from torch.utils.checkpoint import checkpoint
-from tqdm import tqdm
 
 
 @dataclass
@@ -240,7 +239,7 @@ def sample_with_config_steps(diffusion, motion_f, text_f, shape, branch_cfg):
 
 
 @torch.no_grad()
-def run_periodic_eval(step, cfg, diffusion, unet, cond_proj, eval_ds, vocoder, device, reward_cfg, use_bf16=False):
+def run_periodic_eval(step, cfg, diffusion, unet, cond_proj, eval_ds, vocoder, device, reward_cfg):
     """Generate a few validation samples and vocode gen + ground-truth mels to wav.
 
     Writes ``eval_dir/step_XXXXXXXX/sample_YYYYYYYY/{gt,gen}.wav`` so each eval
@@ -266,16 +265,10 @@ def run_periodic_eval(step, cfg, diffusion, unet, cond_proj, eval_ds, vocoder, d
             lyrics = sample["lyrics"].unsqueeze(0).to(device)
 
             motion_f, text_f = cond_proj(motion, lyrics)
-            if use_bf16:
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    out = sample_with_config_steps(
-                        diffusion, motion_f, text_f, (1, 80, mel.shape[1]), cfg["branchgrpo"]
-                    )
-            else:
-                out = sample_with_config_steps(
-                    diffusion, motion_f, text_f, (1, 80, mel.shape[1]), cfg["branchgrpo"]
-                )
-            gen_mel = out.squeeze(0).float().detach().cpu().numpy()  # (80, T)
+            out = sample_with_config_steps(
+                diffusion, motion_f, text_f, (1, 80, mel.shape[1]), cfg["branchgrpo"]
+            )
+            gen_mel = out.squeeze(0).detach().cpu().numpy()  # (80, T)
             # de-normalize rollout output back to raw BigVGAN log-mel space.
             gen_mel = gen_mel * float(diffusion.dataset_std) + float(diffusion.dataset_mean)
 
@@ -361,7 +354,7 @@ def gaussian_logprob(sample: torch.Tensor, mean: torch.Tensor, var: torch.Tensor
     return ll.flatten(1).mean(dim=1)
 
 
-def _transition_stats(diffusion, unet, x_t, t_batch, motion_f, text_f, use_bf16=False):
+def _transition_stats(diffusion, unet, x_t, t_batch, motion_f, text_f):
     beta_t = diffusion.betas[t_batch]
     alpha_t = diffusion.alphas[t_batch]
     alpha_bar_t = diffusion.alpha_bars[t_batch]
@@ -369,14 +362,7 @@ def _transition_stats(diffusion, unet, x_t, t_batch, motion_f, text_f, use_bf16=
         beta_t = beta_t[..., None]
         alpha_t = alpha_t[..., None]
         alpha_bar_t = alpha_bar_t[..., None]
-    if use_bf16:
-        # bf16 mixed precision for the UNet forward; upcast eps to fp32 so the
-        # transition mean and downstream log-prob math stay numerically stable.
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            eps = unet(x_t, t_batch, motion_f, text_f)
-        eps = eps.float()
-    else:
-        eps = unet(x_t, t_batch, motion_f, text_f)
+    eps = unet(x_t, t_batch, motion_f, text_f)
     mean = (1.0 / alpha_t.sqrt()) * (x_t - (beta_t / (1.0 - alpha_bar_t).sqrt()) * eps)
     mask = (t_batch > 0).view(-1, 1, 1).float()
     return mean, beta_t, mask
@@ -386,9 +372,8 @@ def _sample_from_mean(mean, beta_t, mask, noise):
     return mean + beta_t.sqrt() * noise * mask
 
 
-def run_tree_rollout(diffusion, unet, motion_f, text_f, sample_shape, branch_cfg: dict, skip_depths: Optional[Set[int]] = None, use_bf16: bool = False):
+def run_tree_rollout(diffusion, unet, motion_f, text_f, sample_shape, branch_cfg: dict):
     device = sample_shape.device
-    skip_depths = skip_depths or set()
     bsz = sample_shape.shape[0]
     total_steps = min(int(branch_cfg["rollout_steps"]), int(branch_cfg["diffusion_timesteps"]))
     split_points = parse_split_points(branch_cfg, total_steps)
@@ -415,7 +400,7 @@ def run_tree_rollout(diffusion, unet, motion_f, text_f, sample_shape, branch_cfg
         current_nodes.append(root)
         nodes_by_depth[0].append(root)
 
-    for step_i in tqdm(range(total_steps), desc="rollout", leave=False):
+    for step_i in range(total_steps):
         t = int(diffusion.T - 1 - step_i)
         if t < 0:
             break
@@ -428,7 +413,7 @@ def run_tree_rollout(diffusion, unet, motion_f, text_f, sample_shape, branch_cfg
         text_step = text_f[batch_ids]
 
         with torch.no_grad():
-            mean, beta_t, mask = _transition_stats(diffusion, unet, x_t, t_batch, motion_step, text_step, use_bf16=use_bf16)
+            mean, beta_t, mask = _transition_stats(diffusion, unet, x_t, t_batch, motion_step, text_step)
 
         next_nodes = []
         for ni, node in enumerate(current_nodes):
@@ -472,22 +457,6 @@ def run_tree_rollout(diffusion, unet, motion_f, text_f, sample_shape, branch_cfg
             nodes_by_depth[n.depth].append(n)
 
     leaf_nodes = current_nodes
-<<<<<<< HEAD
-=======
-
-    old_path_logprobs = []
-    for leaf in leaf_nodes:
-        # Skip the shared pre-split trunk so old/new log-prob sums cover the same
-        # edge set (keeps the PPO ratio consistent when trunk pruning is on).
-        path = [p for p in leaf.path_from_root()[1:] if p.depth not in skip_depths]
-        if len(path) == 0:
-            old_path_logprobs.append(torch.tensor(0.0, device=device))
-            continue
-        lp = torch.stack([p.edge_logprob.to(device) for p in path], dim=0).sum()
-        old_path_logprobs.append(lp)
-
-    old_path_logprobs = torch.stack(old_path_logprobs, dim=0)
->>>>>>> 342fdbe (Added pruning of adv for shared prefix)
     final_mel = torch.cat([n.latent for n in leaf_nodes], dim=0)
     return roots, leaf_nodes, nodes_by_depth, final_mel
 
@@ -541,7 +510,6 @@ def compute_depthwise_advantages(
             node.advantage = adv[i]
 
 
-<<<<<<< HEAD
 def select_leaves_for_backprop(
     leaf_nodes: List[TreeNode], mode: str, extreme_b: int
 ) -> List[TreeNode]:
@@ -582,42 +550,8 @@ def gather_backprop_edges(
 def recompute_edge_logprobs(
     diffusion, unet, motion_f, text_f, edges: List[TreeNode], use_checkpoint: bool = False
 ):
-=======
-def gather_leaf_advantages(
-    leaf_nodes: List[TreeNode],
-    depth_pruning: Set[int],
-    skip_depths: Optional[Set[int]] = None,
-) -> torch.Tensor:
-    """Average each leaf's advantages over trainable, post-split edges only.
-
-    Shared-trunk nodes have zero advantage because no alternatives exist at
-    those depths. Including them in the mean dilutes the useful branch signal
-    by the full rollout length (for example, 5 active edges / 1000 total).
-    Keep the advantage and log-prob edge sets aligned by excluding the same
-    shared-trunk depths here as in the PPO ratio calculation.
-    """
-    skip_depths = skip_depths or set()
-    out = []
-    for leaf in leaf_nodes:
-        path_nodes = leaf.path_from_root()[1:]
-        path_adv = [
-            n.advantage
-            for n in path_nodes
-            if n.depth not in depth_pruning and n.depth not in skip_depths
-        ]
-        if len(path_adv) == 0:
-            out.append(torch.tensor(0.0, device=leaf.latent.device))
-        else:
-            out.append(torch.stack(path_adv, dim=0).mean())
-    return torch.stack(out, dim=0)
-
-
-def recompute_leaf_path_logprobs(diffusion, unet, motion_f, text_f, leaf_nodes: List[TreeNode], depth_pruning: Set[int], skip_depths: Optional[Set[int]] = None, use_checkpoint: bool = False, use_bf16: bool = False):
->>>>>>> 342fdbe (Added pruning of adv for shared prefix)
     device = motion_f.device
-    skip_depths = skip_depths or set()
     out = []
-<<<<<<< HEAD
     for edge_node in edges:
         x_t = edge_node.edge_x_t.to(device)
         x_prev = edge_node.edge_x_prev.to(device)
@@ -635,36 +569,6 @@ def recompute_leaf_path_logprobs(diffusion, unet, motion_f, text_f, leaf_nodes: 
             mean, beta_t = checkpoint(
                 _transition, x_t, motion, text, use_reentrant=False
             )
-=======
-    for leaf in leaf_nodes:
-        path = leaf.path_from_root()[1:]
-        lp_terms = []
-        for edge_node in path:
-            if edge_node.depth in depth_pruning or edge_node.depth in skip_depths:
-                continue
-            x_t = edge_node.edge_x_t.to(device)
-            x_prev = edge_node.edge_x_prev.to(device)
-            t_batch = torch.full((1,), int(edge_node.edge_t), device=device, dtype=torch.long)
-            m = motion_f[edge_node.batch_idx : edge_node.batch_idx + 1]
-            tx = text_f[edge_node.batch_idx : edge_node.batch_idx + 1]
-
-            if use_checkpoint:
-                # Recompute this step's UNet activations during backward instead
-                # of storing them, trading compute for a large memory saving.
-                # preserve_rng_state (default) keeps dropout masks consistent.
-                def _transition(x_in, m_in, tx_in, _t=t_batch):
-                    mean_, beta_, _ = _transition_stats(diffusion, unet, x_in, _t, m_in, tx_in, use_bf16=use_bf16)
-                    return mean_, beta_
-
-                mean, beta_t = checkpoint(_transition, x_t, m, tx, use_reentrant=False)
-            else:
-                mean, beta_t, _ = _transition_stats(diffusion, unet, x_t, t_batch, m, tx, use_bf16=use_bf16)
-            lp = gaussian_logprob(x_prev, mean, beta_t)
-            lp_terms.append(lp[0])
-
-        if len(lp_terms) == 0:
-            out.append(torch.tensor(0.0, device=device))
->>>>>>> 342fdbe (Added pruning of adv for shared prefix)
         else:
             mean, beta_t, _ = _transition_stats(
                 diffusion, unet, x_t, t_batch, motion, text
@@ -702,10 +606,6 @@ def main() -> None:
     ensure_dir(tmp_audio_dir)
 
     train_ds = MelDataset(cfg["paths"]["train_npz_dir"], align_mode="interp")
-    max_train_samples = int(cfg["train"].get("max_train_samples", 0) or 0)
-    if max_train_samples > 0 and max_train_samples < len(train_ds):
-        train_ds = torch.utils.data.Subset(train_ds, list(range(max_train_samples)))
-        print(f"[data] limiting training set to first {max_train_samples} samples")
     loader = DataLoader(
         train_ds,
         batch_size=int(cfg["train"]["batch_size"]),
@@ -797,29 +697,6 @@ def main() -> None:
     depth_pruning = parse_depth_pruning(cfg["branchgrpo"])
     tree_prob_weighted = bool(cfg["branchgrpo"].get("tree_prob_weighted", False))
 
-    # bf16 mixed precision for the UNet forwards (weights/optimizer stay fp32).
-    want_bf16 = bool(cfg["train"].get("bf16", False))
-    use_bf16 = want_bf16 and torch.cuda.is_available() and torch.cuda.is_bf16_supported()
-    if want_bf16 and not use_bf16:
-        print("[precision] bf16 requested but not supported on this device; falling back to fp32")
-    print(f"[precision] UNet forwards run in {'bf16' if use_bf16 else 'fp32'}")
-
-    # Shared-trunk log-prob pruning: the denoising steps before the first tree
-    # split form a single shared chain (zero advantage). Excluding them from the
-    # PPO log-prob (applied to BOTH old and new sums, so the ratio stays
-    # consistent) removes those forwards from the autograd graph. Advantage
-    # aggregation uses the same post-split edge set, preventing zero-valued
-    # trunk nodes from diluting the learning signal.
-    _total_rollout_steps = min(int(cfg["branchgrpo"]["rollout_steps"]), int(cfg["branchgrpo"]["diffusion_timesteps"]))
-    _split_points = parse_split_points(cfg["branchgrpo"], _total_rollout_steps)
-    if bool(cfg["branchgrpo"].get("prune_shared_trunk", True)) and _split_points:
-        _first_split = min(_split_points)
-        logprob_skip_depths = set(range(1, _first_split + 1))
-        print(f"[mem] pruning shared-trunk log-prob depths 1..{_first_split} "
-              f"({len(logprob_skip_depths)} steps) from the PPO graph")
-    else:
-        logprob_skip_depths = set()
-
     # Periodic evaluation on the validation split: generate a few samples and
     # vocode gen + gt mels to wav (reuses the vocoder loaded above).
     eval_cfg = cfg.get("eval", {}) or {}
@@ -858,8 +735,6 @@ def main() -> None:
                 text_f,
                 sample_shape=torch.zeros_like(gt_mel),
                 branch_cfg=cfg["branchgrpo"],
-                skip_depths=logprob_skip_depths,
-                use_bf16=use_bf16,
             )
 
             rewards = []
@@ -896,17 +771,8 @@ def main() -> None:
             rewards_t = torch.as_tensor(rewards, device=device, dtype=torch.float32)
 
             assign_tree_rewards(roots, leaf_nodes, rewards_t, tree_prob_weighted)
-<<<<<<< HEAD
             advantage_clip = cfg["branchgrpo"].get("advantage_clip")
             compute_depthwise_advantages(nodes_by_depth, advantage_clip)
-=======
-            compute_depthwise_advantages(nodes_by_depth)
-            leaf_adv = gather_leaf_advantages(
-                leaf_nodes,
-                depth_pruning,
-                skip_depths=logprob_skip_depths,
-            )
->>>>>>> 342fdbe (Added pruning of adv for shared prefix)
 
             width_mode = str(cfg["branchgrpo"].get("width_pruning_mode", "none"))
             selected_leaves = select_leaves_for_backprop(
@@ -930,15 +796,8 @@ def main() -> None:
                     unet,
                     motion_f,
                     text_f,
-<<<<<<< HEAD
                     edges,
-=======
-                    leaf_nodes,
-                    depth_pruning,
-                    skip_depths=logprob_skip_depths,
->>>>>>> 342fdbe (Added pruning of adv for shared prefix)
                     use_checkpoint=grad_checkpointing,
-                    use_bf16=use_bf16,
                 )
 
                 log_ratio = new_edge_lp - old_edge_lp
@@ -1059,7 +918,6 @@ def main() -> None:
                         vocoder,
                         device,
                         reward_cfg,
-                        use_bf16=use_bf16,
                     )
                 except Exception as e:  # never let eval crash training
                     print(f"[eval] step={step} failed: {e}")
