@@ -135,12 +135,29 @@ def parse_split_points(branch_cfg: dict, total_steps: int) -> Set[int]:
 
 
 def parse_depth_pruning(branch_cfg: dict) -> Set[int]:
+    """Return exact edge depths excluded from backpropagation.
+
+    ``depth_pruning`` accepts individual depths, while
+    ``depth_pruning_ranges`` accepts inclusive ``[start, end]`` pairs.
+    """
     depths = branch_cfg.get("depth_pruning", [])
     if isinstance(depths, str):
         depths = [int(x.strip()) for x in depths.split(",") if x.strip()]
     if depths is None:
         depths = []
-    return {int(x) for x in depths}
+    out = {int(x) for x in depths}
+
+    ranges = branch_cfg.get("depth_pruning_ranges", []) or []
+    for item in ranges:
+        if not isinstance(item, (list, tuple)) or len(item) != 2:
+            raise ValueError(
+                "each depth_pruning_ranges entry must be [start_depth, end_depth]"
+            )
+        start, end = (int(item[0]), int(item[1]))
+        if start < 1 or end < start:
+            raise ValueError(f"invalid depth pruning range: [{start}, {end}]")
+        out.update(range(start, end + 1))
+    return out
 
 
 def wav_to_mfcc(wav: np.ndarray, cfg: dict) -> np.ndarray:
@@ -351,45 +368,8 @@ def _transition_stats(diffusion, unet, x_t, t_batch, motion_f, text_f):
     return mean, beta_t, mask
 
 
-def _sample_from_mean(mean, beta_t, mask, noise_scale=1.0):
-    noise = torch.randn_like(mean)
-    return mean + beta_t.sqrt() * noise * mask * noise_scale
-
-
-def _width_prune_for_step(
-    parents: List[TreeNode],
-    candidates: List[TreeNode],
-    mode: int,
-    ratio: float,
-) -> List[TreeNode]:
-    if mode <= 0:
-        return candidates
-
-    ratio = float(max(0.0, min(1.0, ratio)))
-    if len(candidates) == 0:
-        return candidates
-
-    if mode == 1:
-        # Per-parent local prune.
-        out = []
-        parent_to_children = defaultdict(list)
-        for c in candidates:
-            parent_to_children[c.parent.node_id].append(c)
-        for p in parents:
-            ch = parent_to_children.get(p.node_id, [])
-            if not ch:
-                continue
-            keep = max(1, int(np.ceil(len(ch) * ratio)))
-            ch_sorted = sorted(ch, key=lambda n: float(n.edge_logprob.item()), reverse=True)
-            out.extend(ch_sorted[:keep])
-        return out
-
-    if mode == 2:
-        # Global keep: top-K only.
-        keep = max(1, int(np.ceil(len(candidates) * ratio)))
-        return sorted(candidates, key=lambda n: float(n.edge_logprob.item()), reverse=True)[:keep]
-
-    return candidates
+def _sample_from_mean(mean, beta_t, mask, noise):
+    return mean + beta_t.sqrt() * noise * mask
 
 
 def run_tree_rollout(diffusion, unet, motion_f, text_f, sample_shape, branch_cfg: dict):
@@ -399,9 +379,9 @@ def run_tree_rollout(diffusion, unet, motion_f, text_f, sample_shape, branch_cfg
     split_points = parse_split_points(branch_cfg, total_steps)
 
     num_generations = int(branch_cfg["num_generations"])
-    split_noise_scale = float(branch_cfg.get("tree_split_noise_scale", 1.0))
-    width_mode = int(branch_cfg.get("width_pruning_mode", 0))
-    width_ratio = float(branch_cfg.get("width_pruning_ratio", 1.0))
+    branch_correlation = float(branch_cfg.get("branch_correlation", 1.0))
+    if branch_correlation < 0:
+        raise ValueError("branch_correlation must be non-negative")
 
     roots = []
     current_nodes = []
@@ -443,10 +423,18 @@ def run_tree_rollout(diffusion, unet, motion_f, text_f, sample_shape, branch_cfg
             parent_x_t = x_t[ni : ni + 1]
 
             child_count = num_generations if should_split else 1
-            created = []
+            # Equation (2): fresh shared noise at each split plus independent
+            # innovations. Normalization preserves N(0, I) child marginals.
+            shared_noise = torch.randn_like(parent_mean) if should_split else None
             for ci in range(child_count):
-                scale = split_noise_scale if should_split else 1.0
-                x_prev = _sample_from_mean(parent_mean, parent_beta, parent_mask, noise_scale=scale)
+                if should_split:
+                    innovation = torch.randn_like(parent_mean)
+                    noise = (shared_noise + branch_correlation * innovation) / np.sqrt(
+                        1.0 + branch_correlation**2
+                    )
+                else:
+                    noise = torch.randn_like(parent_mean)
+                x_prev = _sample_from_mean(parent_mean, parent_beta, parent_mask, noise)
                 lp = gaussian_logprob(x_prev.detach(), parent_mean.detach(), parent_beta.detach())
 
                 child = TreeNode(
@@ -462,37 +450,15 @@ def run_tree_rollout(diffusion, unet, motion_f, text_f, sample_shape, branch_cfg
                     edge_t=t,
                 )
                 node.add_child(child)
-                created.append(child)
-
-            if should_split and width_mode > 0:
-                kept = _width_prune_for_step([node], created, width_mode, width_ratio)
-                next_nodes.extend(kept)
-            else:
-                next_nodes.extend(created)
-
-        if should_split and width_mode == 2:
-            # Optional global prune after local expansion.
-            next_nodes = _width_prune_for_step(current_nodes, next_nodes, width_mode, width_ratio)
+                next_nodes.append(child)
 
         current_nodes = next_nodes
         for n in current_nodes:
             nodes_by_depth[n.depth].append(n)
 
     leaf_nodes = current_nodes
-
-    old_path_logprobs = []
-    for leaf in leaf_nodes:
-        path = leaf.path_from_root()[1:]
-        if len(path) == 0:
-            old_path_logprobs.append(torch.tensor(0.0, device=device))
-            continue
-        lp = torch.stack([p.edge_logprob.to(device) for p in path], dim=0).sum()
-        old_path_logprobs.append(lp)
-
-    old_path_logprobs = torch.stack(old_path_logprobs, dim=0)
     final_mel = torch.cat([n.latent for n in leaf_nodes], dim=0)
-    return roots, leaf_nodes, nodes_by_depth, old_path_logprobs, final_mel
-
+    return roots, leaf_nodes, nodes_by_depth, final_mel
 
 def assign_tree_rewards(
     roots: List[TreeNode],
@@ -525,70 +491,90 @@ def assign_tree_rewards(
             n.reward = child_rewards.mean()
 
 
-def compute_depthwise_advantages(nodes_by_depth: Dict[int, List[TreeNode]]):
-    for depth, nodes in nodes_by_depth.items():
+def compute_depthwise_advantages(
+    nodes_by_depth: Dict[int, List[TreeNode]], advantage_clip: Optional[float] = None
+):
+    for nodes in nodes_by_depth.values():
         if len(nodes) == 1:
             nodes[0].advantage = torch.tensor(0.0, device=nodes[0].latent.device)
             continue
         rewards = torch.stack([n.reward for n in nodes], dim=0)
-        mean = rewards.mean()
         std = rewards.std(unbiased=False)
         if float(std.item()) < 1e-8:
             adv = torch.zeros_like(rewards)
         else:
-            adv = (rewards - mean) / (std + 1e-8)
-        for i, n in enumerate(nodes):
-            n.advantage = adv[i]
+            adv = (rewards - rewards.mean()) / (std + 1e-8)
+        if advantage_clip is not None:
+            adv = adv.clamp(-float(advantage_clip), float(advantage_clip))
+        for i, node in enumerate(nodes):
+            node.advantage = adv[i]
 
 
-def gather_leaf_advantages(leaf_nodes: List[TreeNode], depth_pruning: Set[int]) -> torch.Tensor:
-    out = []
+def select_leaves_for_backprop(
+    leaf_nodes: List[TreeNode], mode: str, extreme_b: int
+) -> List[TreeNode]:
+    """Width-prune only after all leaf rewards have been fused and normalized."""
+    if mode == "none":
+        return leaf_nodes
+    if mode == "parent_top1":
+        groups = defaultdict(list)
+        for leaf in leaf_nodes:
+            split_parent = None
+            for node in reversed(leaf.path_from_root()[1:]):
+                if len(node.parent.children) > 1:
+                    split_parent = node.parent
+                    break
+            key = split_parent.node_id if split_parent is not None else leaf.node_id
+            groups[key].append(leaf)
+        return [max(group, key=lambda n: float(n.reward.item())) for group in groups.values()]
+    if mode == "extreme":
+        b = max(1, int(extreme_b))
+        ordered = sorted(leaf_nodes, key=lambda n: float(n.reward.item()))
+        selected = ordered[:b] + ordered[-b:]
+        return list({node.node_id: node for node in selected}.values())
+    raise ValueError(f"unknown width_pruning_mode: {mode}")
+
+
+def gather_backprop_edges(
+    leaf_nodes: List[TreeNode], depth_pruning: Set[int]
+) -> List[TreeNode]:
+    # A shared-prefix transition is one tree edge, not one copy per leaf path.
+    edges = {}
     for leaf in leaf_nodes:
-        path_nodes = leaf.path_from_root()[1:]
-        path_adv = [n.advantage for n in path_nodes if n.depth not in depth_pruning]
-        if len(path_adv) == 0:
-            out.append(torch.tensor(0.0, device=leaf.latent.device))
-        else:
-            out.append(torch.stack(path_adv, dim=0).mean())
-    return torch.stack(out, dim=0)
+        for node in leaf.path_from_root()[1:]:
+            if node.depth not in depth_pruning:
+                edges[node.node_id] = node
+    return list(edges.values())
 
 
-def recompute_leaf_path_logprobs(diffusion, unet, motion_f, text_f, leaf_nodes: List[TreeNode], depth_pruning: Set[int], use_checkpoint: bool = False):
+def recompute_edge_logprobs(
+    diffusion, unet, motion_f, text_f, edges: List[TreeNode], use_checkpoint: bool = False
+):
     device = motion_f.device
     out = []
-    for leaf in leaf_nodes:
-        path = leaf.path_from_root()[1:]
-        lp_terms = []
-        for edge_node in path:
-            if edge_node.depth in depth_pruning:
-                continue
-            x_t = edge_node.edge_x_t.to(device)
-            x_prev = edge_node.edge_x_prev.to(device)
-            t_batch = torch.full((1,), int(edge_node.edge_t), device=device, dtype=torch.long)
-            m = motion_f[edge_node.batch_idx : edge_node.batch_idx + 1]
-            tx = text_f[edge_node.batch_idx : edge_node.batch_idx + 1]
+    for edge_node in edges:
+        x_t = edge_node.edge_x_t.to(device)
+        x_prev = edge_node.edge_x_prev.to(device)
+        t_batch = torch.full((1,), int(edge_node.edge_t), device=device, dtype=torch.long)
+        motion = motion_f[edge_node.batch_idx : edge_node.batch_idx + 1]
+        text = text_f[edge_node.batch_idx : edge_node.batch_idx + 1]
 
-            if use_checkpoint:
-                # Recompute this step's UNet activations during backward instead
-                # of storing them, trading compute for a large memory saving.
-                # preserve_rng_state (default) keeps dropout masks consistent.
-                def _transition(x_in, m_in, tx_in, _t=t_batch):
-                    mean_, beta_, _ = _transition_stats(diffusion, unet, x_in, _t, m_in, tx_in)
-                    return mean_, beta_
+        if use_checkpoint:
+            def _transition(x_in, motion_in, text_in, _t=t_batch):
+                mean_, beta_, _ = _transition_stats(
+                    diffusion, unet, x_in, _t, motion_in, text_in
+                )
+                return mean_, beta_
 
-                mean, beta_t = checkpoint(_transition, x_t, m, tx, use_reentrant=False)
-            else:
-                mean, beta_t, _ = _transition_stats(diffusion, unet, x_t, t_batch, m, tx)
-            lp = gaussian_logprob(x_prev, mean, beta_t)
-            lp_terms.append(lp[0])
-
-        if len(lp_terms) == 0:
-            out.append(torch.tensor(0.0, device=device))
+            mean, beta_t = checkpoint(
+                _transition, x_t, motion, text, use_reentrant=False
+            )
         else:
-            out.append(torch.stack(lp_terms, dim=0).sum())
-
+            mean, beta_t, _ = _transition_stats(
+                diffusion, unet, x_t, t_batch, motion, text
+            )
+        out.append(gaussian_logprob(x_prev, mean, beta_t)[0])
     return torch.stack(out, dim=0)
-
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Single-GPU lyrics+dance BranchGRPO training (UNet, full tree-split)")
@@ -742,7 +728,7 @@ def main() -> None:
 
             motion_f, text_f = cond_proj(motion, lyrics)
 
-            roots, leaf_nodes, nodes_by_depth, old_lp_sum, final_mel = run_tree_rollout(
+            roots, leaf_nodes, nodes_by_depth, final_mel = run_tree_rollout(
                 diffusion,
                 unet,
                 motion_f,
@@ -785,35 +771,54 @@ def main() -> None:
             rewards_t = torch.as_tensor(rewards, device=device, dtype=torch.float32)
 
             assign_tree_rewards(roots, leaf_nodes, rewards_t, tree_prob_weighted)
-            compute_depthwise_advantages(nodes_by_depth)
-            leaf_adv = gather_leaf_advantages(leaf_nodes, depth_pruning)
+            advantage_clip = cfg["branchgrpo"].get("advantage_clip")
+            compute_depthwise_advantages(nodes_by_depth, advantage_clip)
 
-            for _ in range(ppo_epochs):
-                new_lp_sum = recompute_leaf_path_logprobs(
+            width_mode = str(cfg["branchgrpo"].get("width_pruning_mode", "none"))
+            selected_leaves = select_leaves_for_backprop(
+                leaf_nodes,
+                width_mode,
+                int(cfg["branchgrpo"].get("width_pruning_extreme_b", 1)),
+            )
+            edges = gather_backprop_edges(selected_leaves, depth_pruning)
+            if not edges:
+                raise RuntimeError("pruning removed every edge from the GRPO update")
+            edge_adv = torch.stack([edge.advantage for edge in edges]).detach()
+            edge_adv = edge_adv * float(cfg["branchgrpo"].get("advantage_scale", 1.0))
+            old_edge_lp = torch.stack([edge.edge_logprob for edge in edges]).to(device)
+
+            for update_idx in range(ppo_epochs):
+                if update_idx > 0:
+                    # Rebuild the conditioning graph after the previous backward.
+                    motion_f, text_f = cond_proj(motion, lyrics)
+                new_edge_lp = recompute_edge_logprobs(
                     diffusion,
                     unet,
                     motion_f,
                     text_f,
-                    leaf_nodes,
-                    depth_pruning,
+                    edges,
                     use_checkpoint=grad_checkpointing,
                 )
 
-                ratio = torch.exp(new_lp_sum - old_lp_sum)
-                obj1 = ratio * leaf_adv
-                obj2 = torch.clamp(ratio, 1.0 - clip_range, 1.0 + clip_range) * leaf_adv
+                log_ratio = new_edge_lp - old_edge_lp
+                ratio = torch.exp(log_ratio)
+                obj1 = ratio * edge_adv
+                obj2 = torch.clamp(ratio, 1.0 - clip_range, 1.0 + clip_range) * edge_adv
                 ppo_loss = -torch.mean(torch.min(obj1, obj2))
 
-                kl_term = torch.mean(old_lp_sum - new_lp_sum)
+                # Sample-based forward-KL approximation, non-negative in expectation.
+                kl_term = torch.mean(torch.exp(log_ratio) - 1.0 - log_ratio)
                 loss = ppo_loss + kl_beta * kl_term
 
                 optim.zero_grad(set_to_none=True)
                 loss.backward()
+                parameters = list(unet.parameters()) + list(cond_proj.parameters())
                 grad_clip = cfg["train"]["grad_clip"]
                 if grad_clip is not None:
-                    torch.nn.utils.clip_grad_norm_(
-                        list(unet.parameters()) + list(cond_proj.parameters()),
-                        float(grad_clip),
+                    grad_norm = torch.nn.utils.clip_grad_norm_(parameters, float(grad_clip))
+                else:
+                    grad_norm = torch.linalg.vector_norm(
+                        torch.stack([p.grad.detach().norm() for p in parameters if p.grad is not None])
                     )
                 optim.step()
 
@@ -825,17 +830,40 @@ def main() -> None:
                     ema_p.data.mul_(ema_decay).add_(p.data * (1.0 - ema_decay))
 
             if step % int(cfg["train"]["log_every_steps"]) == 0:
+                # Measure policy movement after the update. With one PPO epoch,
+                # pre-update ratios are identically 1 and are not diagnostic.
+                with torch.no_grad():
+                    diagnostic_motion_f, diagnostic_text_f = cond_proj(motion, lyrics)
+                    diagnostic_lp = recompute_edge_logprobs(
+                        diffusion,
+                        unet,
+                        diagnostic_motion_f,
+                        diagnostic_text_f,
+                        edges,
+                    )
+                    diagnostic_log_ratio = diagnostic_lp - old_edge_lp
+                    diagnostic_ratio = torch.exp(diagnostic_log_ratio)
+                    diagnostic_kl = torch.mean(
+                        diagnostic_ratio - 1.0 - diagnostic_log_ratio
+                    )
                 avg_reward = float(np.mean(rewards)) if len(rewards) > 0 else 0.0
                 total_nodes = sum(len(v) for v in nodes_by_depth.values())
-                avg_ratio = float(ratio.mean().item()) if ratio.numel() > 0 else 0.0
-                # GRPO advantages are zero-centred per depth, so their mean is
-                # ~0 by construction. Log the mean-absolute advantage (signal
-                # magnitude) instead, which is what actually drives the update.
-                adv_abs = float(leaf_adv.abs().mean().item()) if leaf_adv.numel() > 0 else 0.0
+                avg_ratio = float(diagnostic_ratio.mean().item())
+                reward_std = float(np.std(rewards)) if rewards else 0.0
+                adv_abs = float(edge_adv.abs().mean().item())
+                ratio_std = float(diagnostic_ratio.std(unbiased=False).item())
+                clip_fraction = float(
+                    ((diagnostic_ratio - 1.0).abs() > clip_range).float().mean().item()
+                )
+                approx_kl = float(diagnostic_kl.item())
+                grad_norm_value = float(grad_norm.item())
                 print(
                     f"epoch={epoch} step={step} loss={float(loss.item()):.6f} "
                     f"reward={avg_reward:.6f} leaves={len(leaf_nodes)} "
-                    f"nodes={total_nodes} ratio={avg_ratio:.4f} adv_abs={adv_abs:.4f} "
+                    f"nodes={total_nodes} edges={len(edges)} ratio={avg_ratio:.4f} "
+                    f"ratio_std={ratio_std:.4f} kl={approx_kl:.6f} "
+                    f"grad_norm={grad_norm_value:.4f} reward_std={reward_std:.4f} "
+                    f"clip_frac={clip_fraction:.4f} adv_abs={adv_abs:.4f} "
                     f"split_points={sorted(parse_split_points(cfg['branchgrpo'], int(cfg['branchgrpo']['rollout_steps'])))}"
                 )
                 train_log.append(
@@ -844,9 +872,16 @@ def main() -> None:
                         "step": step,
                         "loss": float(loss.item()),
                         "avg_reward": avg_reward,
+                        "reward_std": reward_std,
                         "num_leaves": len(leaf_nodes),
+                        "selected_leaves": len(selected_leaves),
                         "total_nodes": total_nodes,
+                        "backprop_edges": len(edges),
                         "avg_ratio": avg_ratio,
+                        "ratio_std": ratio_std,
+                        "approx_kl": approx_kl,
+                        "grad_norm": grad_norm_value,
+                        "clip_fraction": clip_fraction,
                         "mean_abs_advantage": adv_abs,
                         "w_fad": w_fad,
                         "w_mfcc": w_mfcc,

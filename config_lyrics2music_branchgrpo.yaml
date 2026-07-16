@@ -35,13 +35,18 @@ branchgrpo:
   diffusion_timesteps: 1000
   rollout_steps: 1000
   tree_split_points: [990]
-  tree_split_noise_scale: 1.0
+  # Paper's s: 0 gives identical siblings; larger values approach independence.
+  branch_correlation: 4.0
   tree_prob_weighted: false
+  advantage_clip: 5.0
+  advantage_scale: 1.0
 
-  # Pruning controls
-  width_pruning_mode: 0      # 0=off, 1=per-parent, 2=global top-k
-  width_pruning_ratio: 1.0   # keep ratio for width pruning
-  depth_pruning: []          # depth ids to exclude from PPO logprob/advantage
+  # Pruning controls (applied after rewards/advantages, for backprop only)
+  width_pruning_mode: none   # none, parent_top1, or extreme
+  width_pruning_extreme_b: 1 # extreme keeps global best b and worst b leaves
+  depth_pruning: []          # individual edge depths to exclude from backprop
+  # Split step 990 creates children at depth 991. Skip the shared, zero-signal prefix.
+  depth_pruning_ranges: [[1, 990]] # inclusive [start_depth, end_depth] ranges
 
 model:
   cond_dim: 128
