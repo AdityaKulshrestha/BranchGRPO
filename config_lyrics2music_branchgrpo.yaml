@@ -24,6 +24,8 @@ train:
   ppo_epochs: 1
   clip_range: 0.2
   kl_beta: 0.0
+  # Analytic transition KL to the immutable SFT initialization.
+  ref_kl_beta: 0.01
   grad_checkpointing: true   # recompute UNet activations in backward to cut memory at high rollout_steps
   # GRPO policy initialization: pretrained checkpoint (EMA weights + mel stats reused).
   init_checkpoint: /home/anam/dance2music/shared_codebase/checkpoints_exact/ckpt_final_none.pt
@@ -65,9 +67,14 @@ reward:
   n_mels: 80
   griffin_lim_iters: 32
   mfcc_n: 40
-  # reward = w_fad * score_fad + w_mfcc * score_mfcc
-  w_fad: 1.0
-  w_mfcc: 0.0
+  # reward = w_fad * (-PANN_L2) + w_mfcc * (-MFCC_MSE)
+  #          + w_mrstft * MRSTFTSimilarity
+  w_fad: 0.0
+  w_mfcc: 1.0
+  w_mrstft: 0.0
+  mrstft_fft_sizes: [512, 1024, 2048]
+  mrstft_hop_sizes: [128, 256, 512]
+  mrstft_win_lengths: [512, 1024, 2048]
 
 eval:
   eval_every_steps: 100

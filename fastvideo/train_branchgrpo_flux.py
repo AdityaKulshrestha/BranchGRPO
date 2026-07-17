@@ -171,6 +171,32 @@ def wav_to_mfcc(wav: np.ndarray, cfg: dict) -> np.ndarray:
     return mfcc.astype(np.float32)
 
 
+def mrstft_similarity(reference: np.ndarray, generated: np.ndarray, cfg: dict) -> float:
+    """Mean cosine similarity of STFT magnitudes at several resolutions."""
+    fft_sizes = cfg.get("mrstft_fft_sizes", [512, 1024, 2048])
+    hop_sizes = cfg.get("mrstft_hop_sizes", [128, 256, 512])
+    win_lengths = cfg.get("mrstft_win_lengths", fft_sizes)
+    if not (len(fft_sizes) == len(hop_sizes) == len(win_lengths)):
+        raise ValueError("MR-STFT fft, hop, and window lists must have equal lengths")
+
+    similarities = []
+    for n_fft, hop_length, win_length in zip(fft_sizes, hop_sizes, win_lengths):
+        ref_mag = np.abs(librosa.stft(
+            reference, n_fft=int(n_fft), hop_length=int(hop_length),
+            win_length=int(win_length)
+        )).astype(np.float64)
+        gen_mag = np.abs(librosa.stft(
+            generated, n_fft=int(n_fft), hop_length=int(hop_length),
+            win_length=int(win_length)
+        )).astype(np.float64)
+        frames = min(ref_mag.shape[1], gen_mag.shape[1])
+        ref_flat = ref_mag[:, :frames].reshape(-1)
+        gen_flat = gen_mag[:, :frames].reshape(-1)
+        denom = np.linalg.norm(ref_flat) * np.linalg.norm(gen_flat)
+        similarities.append(float(np.dot(ref_flat, gen_flat) / (denom + 1e-12)))
+    return float(np.mean(similarities))
+
+
 def load_bigvgan(bigvgan_dir, device, model_name="nvidia/bigvgan_22khz_80band", fmax=8000):
     """Load the BigVGAN vocoder, isolating its conflicting top-level modules.
 
@@ -548,10 +574,12 @@ def gather_backprop_edges(
 
 
 def recompute_edge_logprobs(
-    diffusion, unet, motion_f, text_f, edges: List[TreeNode], use_checkpoint: bool = False
+    diffusion, unet, motion_f, text_f, edges: List[TreeNode], use_checkpoint: bool = False,
+    ref_unet=None, ref_motion_f=None, ref_text_f=None,
 ):
     device = motion_f.device
     out = []
+    ref_kls = []
     for edge_node in edges:
         x_t = edge_node.edge_x_t.to(device)
         x_prev = edge_node.edge_x_prev.to(device)
@@ -574,7 +602,22 @@ def recompute_edge_logprobs(
                 diffusion, unet, x_t, t_batch, motion, text
             )
         out.append(gaussian_logprob(x_prev, mean, beta_t)[0])
-    return torch.stack(out, dim=0)
+        if ref_unet is not None:
+            with torch.no_grad():
+                ref_motion = ref_motion_f[edge_node.batch_idx : edge_node.batch_idx + 1]
+                ref_text = ref_text_f[edge_node.batch_idx : edge_node.batch_idx + 1]
+                ref_mean, _, _ = _transition_stats(
+                    diffusion, ref_unet, x_t, t_batch, ref_motion, ref_text
+                )
+            # Analytic KL between current and frozen-SFT Gaussian transitions.
+            # Both policies use the same fixed diffusion variance.
+            ref_kls.append(
+                (((mean - ref_mean) ** 2) / (2.0 * beta_t.clamp_min(1e-8))).mean()
+            )
+    logprobs = torch.stack(out, dim=0)
+    if ref_unet is None:
+        return logprobs
+    return logprobs, torch.stack(ref_kls).mean()
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Single-GPU lyrics+dance BranchGRPO training (UNet, full tree-split)")
@@ -655,6 +698,12 @@ def main() -> None:
     else:
         print("[init] no init_checkpoint provided; training from scratch (mean=0/std=1)")
 
+    # Immutable SFT policy used as the reference anchor throughout RL training.
+    ref_unet = copy.deepcopy(unet).eval()
+    ref_cond_proj = copy.deepcopy(cond_proj).eval()
+    for p in list(ref_unet.parameters()) + list(ref_cond_proj.parameters()):
+        p.requires_grad = False
+
     diffusion = GaussianDiffusion(
         unet,
         timesteps=int(cfg["branchgrpo"]["diffusion_timesteps"]),
@@ -688,11 +737,13 @@ def main() -> None:
     clip_range = float(cfg["train"]["clip_range"])
     ppo_epochs = int(cfg["train"]["ppo_epochs"])
     kl_beta = float(cfg["train"]["kl_beta"])
+    ref_kl_beta = float(cfg["train"].get("ref_kl_beta", 0.0))
     grad_checkpointing = bool(cfg["train"].get("grad_checkpointing", False))
 
     reward_cfg = cfg["reward"]
     w_fad = float(reward_cfg["w_fad"])
     w_mfcc = float(reward_cfg["w_mfcc"])
+    w_mrstft = float(reward_cfg.get("w_mrstft", 0.0))
 
     depth_pruning = parse_depth_pruning(cfg["branchgrpo"])
     tree_prob_weighted = bool(cfg["branchgrpo"].get("tree_prob_weighted", False))
@@ -759,14 +810,22 @@ def main() -> None:
                 # gt/gen PANNs embeddings (matches DanceTreeGRPO per-sample FAD).
                 fad_score = -float(np.linalg.norm(gen_emb - gt_emb))
 
-                # MFCC score: cosine similarity between the mean MFCC vectors
-                # (matches DanceTreeGRPO MFCC reward). Higher = more similar.
-                gt_mfcc = wav_to_mfcc(gt_wav, reward_cfg).mean(axis=1)
-                gen_mfcc = wav_to_mfcc(gen_wav, reward_cfg).mean(axis=1)
-                denom = float(np.linalg.norm(gt_mfcc) * np.linalg.norm(gen_mfcc)) + 1e-8
-                mfcc_score = float(np.dot(gt_mfcc, gen_mfcc) / denom)
+                # Negative MFCC MSE is maximized when generated and reference
+                # cepstral features match.
+                gt_mfcc = wav_to_mfcc(gt_wav, reward_cfg)
+                gen_mfcc = wav_to_mfcc(gen_wav, reward_cfg)
+                mfcc_frames = min(gt_mfcc.shape[1], gen_mfcc.shape[1])
+                mfcc_score = -float(np.mean(
+                    (gt_mfcc[:, :mfcc_frames] - gen_mfcc[:, :mfcc_frames]) ** 2
+                ))
 
-                rewards.append(w_fad * fad_score + w_mfcc * mfcc_score)
+                mrstft_score = mrstft_similarity(gt_wav, gen_wav, reward_cfg)
+
+                rewards.append(
+                    w_fad * fad_score
+                    + w_mfcc * mfcc_score
+                    + w_mrstft * mrstft_score
+                )
 
             rewards_t = torch.as_tensor(rewards, device=device, dtype=torch.float32)
 
@@ -786,18 +845,23 @@ def main() -> None:
             edge_adv = torch.stack([edge.advantage for edge in edges]).detach()
             edge_adv = edge_adv * float(cfg["branchgrpo"].get("advantage_scale", 1.0))
             old_edge_lp = torch.stack([edge.edge_logprob for edge in edges]).to(device)
+            with torch.no_grad():
+                ref_motion_f, ref_text_f = ref_cond_proj(motion, lyrics)
 
             for update_idx in range(ppo_epochs):
                 if update_idx > 0:
                     # Rebuild the conditioning graph after the previous backward.
                     motion_f, text_f = cond_proj(motion, lyrics)
-                new_edge_lp = recompute_edge_logprobs(
+                new_edge_lp, ref_kl_term = recompute_edge_logprobs(
                     diffusion,
                     unet,
                     motion_f,
                     text_f,
                     edges,
                     use_checkpoint=grad_checkpointing,
+                    ref_unet=ref_unet,
+                    ref_motion_f=ref_motion_f,
+                    ref_text_f=ref_text_f,
                 )
 
                 log_ratio = new_edge_lp - old_edge_lp
@@ -808,7 +872,7 @@ def main() -> None:
 
                 # Sample-based forward-KL approximation, non-negative in expectation.
                 kl_term = torch.mean(torch.exp(log_ratio) - 1.0 - log_ratio)
-                loss = ppo_loss + kl_beta * kl_term
+                loss = ppo_loss + kl_beta * kl_term + ref_kl_beta * ref_kl_term
 
                 optim.zero_grad(set_to_none=True)
                 loss.backward()
@@ -862,6 +926,7 @@ def main() -> None:
                     f"reward={avg_reward:.6f} leaves={len(leaf_nodes)} "
                     f"nodes={total_nodes} edges={len(edges)} ratio={avg_ratio:.4f} "
                     f"ratio_std={ratio_std:.4f} kl={approx_kl:.6f} "
+                    f"ref_kl={float(ref_kl_term.item()):.6f} "
                     f"grad_norm={grad_norm_value:.4f} reward_std={reward_std:.4f} "
                     f"clip_frac={clip_fraction:.4f} adv_abs={adv_abs:.4f} "
                     f"split_points={sorted(parse_split_points(cfg['branchgrpo'], int(cfg['branchgrpo']['rollout_steps'])))}"
@@ -880,11 +945,13 @@ def main() -> None:
                         "avg_ratio": avg_ratio,
                         "ratio_std": ratio_std,
                         "approx_kl": approx_kl,
+                        "ref_kl": float(ref_kl_term.item()),
                         "grad_norm": grad_norm_value,
                         "clip_fraction": clip_fraction,
                         "mean_abs_advantage": adv_abs,
                         "w_fad": w_fad,
                         "w_mfcc": w_mfcc,
+                        "w_mrstft": w_mrstft,
                     }
                 )
 
